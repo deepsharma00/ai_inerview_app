@@ -1,0 +1,791 @@
+import React, { useEffect, useState, useCallback } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { useAuth } from '@/context/AuthContext';
+import { useInterview, Question, Interview as InterviewType } from '@/context/InterviewContext';
+import { answerAPI } from '@/api';
+import Layout from '@/components/Layout';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { ArrowLeft, Calendar, Clock, User, Download, CheckCircle, XCircle, Info, RefreshCw, ChevronLeft } from 'lucide-react';
+import AudioPlayer from '@/components/AudioPlayer';
+import TranscriptViewer from '@/components/TranscriptViewer';
+import RadarChartDisplay from '@/components/RadarChartDisplay';
+import {
+  Radar,
+  RadarChart,
+  PolarGrid,
+  PolarAngleAxis,
+  PolarRadiusAxis,
+  ResponsiveContainer,
+  Tooltip,
+  Legend as RechartsLegend
+} from 'recharts';
+import { toast } from 'sonner';
+
+// Define QuestionObject interface for embedded question data
+interface QuestionObject {
+  _id: string;
+  text: string;
+  difficulty?: 'easy' | 'medium' | 'hard';
+}
+
+// Add interface for API answer data
+interface ApiAnswer {
+  _id: string;
+  question: string;
+  interview: string;
+  audioUrl?: string;
+  transcript?: string;
+  score?: number;
+  feedback?: string;
+  criteria?: {
+    technicalAccuracy: number;
+    completeness: number;
+    clarity: number;
+    examples: number;
+  };
+}
+
+// Extended Answer interface to handle questionId either as string or object
+interface Answer {
+  id: string;
+  questionId: string | QuestionObject;
+  audioUrl?: string;
+  transcript?: string;
+  score?: number;
+  feedback?: string;
+  criteria?: {
+    technicalAccuracy: number;
+    completeness: number;
+    clarity: number;
+    examples: number;
+  };
+}
+
+type QuestionWithAnswer = {
+  question: Question;
+  answer: Answer | undefined;
+};
+
+// Add this interface for radar chart data
+interface RadarChartData {
+  subject: string;
+  score: number;
+  fullMark: number;
+}
+
+// Add a function to properly format audio URLs
+const getFullAudioUrl = (relativeUrl?: string): string | undefined => {
+  if (!relativeUrl) return undefined;
+  
+  // If it's already an absolute URL, return it as is
+  if (relativeUrl.startsWith('http')) {
+    console.log('Audio URL is already absolute:', relativeUrl);
+    return relativeUrl;
+  }
+  
+  // If it's just a filename without path or doesn't start with /uploads, add the uploads path
+  if (!relativeUrl.includes('/') || !relativeUrl.includes('/uploads')) {
+    // Remove any leading slashes
+    const cleanFilename = relativeUrl.replace(/^\/+/, '');
+    // If the path doesn't include 'uploads', add it
+    if (!cleanFilename.startsWith('uploads/')) {
+      relativeUrl = `/uploads/${cleanFilename}`;
+    } else {
+      relativeUrl = `/${cleanFilename}`;
+    }
+  }
+  
+  // Get the base API URL
+  const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000/api/v1';
+  
+  // Remove '/api/v1' from the base URL if it exists
+  const baseApiUrl = baseUrl.endsWith('/api/v1') 
+    ? baseUrl.substring(0, baseUrl.length - 7) 
+    : baseUrl;
+  
+  // Ensure the relative URL starts with a slash
+  const formattedPath = relativeUrl.startsWith('/') 
+    ? relativeUrl 
+    : `/${relativeUrl}`;
+  
+  const fullUrl = `${baseApiUrl}${formattedPath}`;
+  console.log(`Original audio URL: ${relativeUrl} -> Formatted: ${fullUrl}`);
+  return fullUrl;
+};
+
+const InterviewReport: React.FC = () => {
+  const { reportId } = useParams<{ reportId: string }>();
+  const { user } = useAuth();
+  const { interviews, getQuestionsForStack, availableTechStacks, refreshQuestions, refreshInterview } = useInterview();
+  const navigate = useNavigate();
+  
+  const [interview, setInterview] = useState<InterviewType | null>(null);
+  const [questionsWithAnswers, setQuestionsWithAnswers] = useState<QuestionWithAnswer[]>([]);
+  const [averageScore, setAverageScore] = useState<number | null>(null);
+  const [criteriaAverages, setCriteriaAverages] = useState<RadarChartData[] | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Function to handle going back to the dashboard
+  const handleBack = () => {
+    // Set active tab to 'reports' in localStorage
+    localStorage.setItem('adminActiveTab', 'reports');
+    // Navigate back to dashboard using react-router
+    navigate('/admin/dashboard');
+  };
+
+  // Function to check if a question and answer match
+  const isMatchingQuestionAndAnswer = (question: Question, answer: Answer): boolean => {
+    // If the questionId is an object, compare its _id with the question.id
+    if (typeof answer.questionId === 'object' && answer.questionId) {
+      const questionObj = answer.questionId as QuestionObject;
+      return questionObj._id === question.id;
+    }
+    
+    // If the questionId is a string, compare directly
+    if (typeof answer.questionId === 'string') {
+      return answer.questionId === question.id;
+    }
+    
+    return false;
+  };
+
+  // Fetch interview data and map questions to answers
+  const fetchInterviewData = useCallback(async () => {
+    if (!reportId) {
+      setError('No interview ID provided');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+      
+      // Find the interview in the context
+      const foundInterview = interviews.find(i => i.id === reportId);
+      
+      if (!foundInterview) {
+        // If not found in context, try to refresh
+        await refreshInterview(reportId);
+        const refreshedInterview = interviews.find(i => i.id === reportId);
+        
+        if (!refreshedInterview) {
+          setError('Interview not found');
+          setLoading(false);
+          return;
+        }
+        
+        setInterview(refreshedInterview);
+      } else {
+        setInterview(foundInterview);
+      }
+      
+      // Calculate average score
+      const scores = foundInterview?.answers
+        .filter(a => typeof a.score === 'number')
+        .map(a => a.score as number);
+      
+      if (scores && scores.length > 0) {
+        const avgScore = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+        setAverageScore(Math.round(avgScore * 10) / 10);
+      }
+      
+      // Calculate criteria averages
+      if (foundInterview?.answers && foundInterview.answers.length > 0) {
+        const criteriaSum = {
+          technicalAccuracy: 0,
+          completeness: 0,
+          clarity: 0,
+          examples: 0,
+          count: 0
+        };
+        
+        foundInterview.answers.forEach(answer => {
+          if (answer.criteria) {
+            criteriaSum.technicalAccuracy += answer.criteria.technicalAccuracy || 0;
+            criteriaSum.completeness += answer.criteria.completeness || 0;
+            criteriaSum.clarity += answer.criteria.clarity || 0;
+            criteriaSum.examples += answer.criteria.examples || 0;
+            criteriaSum.count++;
+          }
+        });
+        
+        if (criteriaSum.count > 0) {
+          const criteriaAveragesData = ([
+            {
+              subject: 'Technical Accuracy',
+              score: criteriaSum.technicalAccuracy / criteriaSum.count,
+              fullMark: 10
+            },
+            {
+              subject: 'Completeness',
+              score: criteriaSum.completeness / criteriaSum.count,
+              fullMark: 10
+            },
+            {
+              subject: 'Clarity',
+              score: criteriaSum.clarity / criteriaSum.count,
+              fullMark: 10
+            },
+            {
+              subject: 'Examples',
+              score: criteriaSum.examples / criteriaSum.count,
+              fullMark: 10
+            }
+          ]);
+          
+          console.log("Radar chart data:", criteriaAveragesData);
+          setCriteriaAverages(criteriaAveragesData);
+        }
+      }
+      
+      // Get questions for the interview's tech stack
+      if (foundInterview?.stackId) {
+        const questions = getQuestionsForStack(foundInterview.stackId);
+        
+        let qaMap: QuestionWithAnswer[] = [];
+        
+        if (questions && questions.length > 0) {
+          console.log(`Found ${questions.length} questions for stack ${foundInterview.stackId}`);
+          console.log(`Found ${foundInterview.answers.length} answers for interview ${foundInterview.id}`);
+        
+          // First, create a map of question IDs to their corresponding answers
+          const questionIdToAnswerMap = new Map();
+          
+          // Process embedded question objects in answers first
+          foundInterview.answers.forEach(answer => {
+            if (typeof answer.questionId === 'object' && answer.questionId) {
+              const questionObj = answer.questionId as QuestionObject;
+              questionIdToAnswerMap.set(questionObj._id, answer);
+              console.log(`Mapped answer ${answer.id} to question ID ${questionObj._id} from embedded object`);
+            }
+          });
+          
+          // Map questions to their answers
+          qaMap = questions.map(question => {
+            // First check if we have a direct mapping from the questionId map
+            if (questionIdToAnswerMap.has(question.id)) {
+              const answer = questionIdToAnswerMap.get(question.id);
+              console.log(`Question ${question.id} (${question.text.substring(0, 30)}...) -> Answer MAPPED DIRECTLY`);
+              return {
+                question,
+                answer
+              };
+            }
+            
+            // Otherwise, try to find a matching answer
+            const matchingAnswer = foundInterview.answers.find(answer => 
+              isMatchingQuestionAndAnswer(question, answer)
+            );
+            
+            console.log(`Question ${question.id} (${question.text.substring(0, 30)}...) -> Answer ${
+              matchingAnswer ? `FOUND (id: ${matchingAnswer.id}, hasAudio: ${!!matchingAnswer.audioUrl}, hasTranscript: ${!!matchingAnswer.transcript})` : 'NOT FOUND'}`);
+            
+            // Additional debug logging for answer content
+            if (matchingAnswer) {
+              console.log('Full answer data:', JSON.stringify({
+                id: matchingAnswer.id,
+                questionId: matchingAnswer.questionId,
+                audioUrl: matchingAnswer.audioUrl,
+                transcriptLength: matchingAnswer.transcript ? matchingAnswer.transcript.length : 0,
+                score: matchingAnswer.score,
+                hasFeedback: !!matchingAnswer.feedback,
+                hasCriteria: !!matchingAnswer.criteria
+              }, null, 2));
+            }
+            
+            return {
+              question,
+              answer: matchingAnswer
+            };
+          });
+        } else {
+          // FALLBACK: If no questions available for this stack, create placeholder questions for each answer
+          console.log('No questions found for stack, creating placeholder questions for answers');
+          
+          if (foundInterview.answers && foundInterview.answers.length > 0) {
+            console.log(`Creating placeholder questions for ${foundInterview.answers.length} answers`);
+            
+            // Try to refresh questions for this stack as a first step
+            await refreshQuestions(foundInterview.stackId);
+            
+            qaMap = foundInterview.answers.map(answer => {
+              // Extract question info if embedded in the answer
+              if (typeof answer.questionId === 'object' && answer.questionId) {
+                const questionObj = answer.questionId as QuestionObject;
+                
+                // Create a question object from the embedded question data
+                const question: Question = {
+                  id: questionObj._id,
+                  text: questionObj.text,
+                  stackId: foundInterview.stackId,
+                  difficulty: questionObj.difficulty || 'medium'
+                };
+                
+                console.log(`Created question from embedded data: ${question.id} (${question.text.substring(0, 30)}...)`);
+                
+                return {
+                  question,
+                  answer
+                };
+              }
+              
+              // Try to find the question in all available stacks
+              const allQuestions = availableTechStacks
+                .flatMap(stack => getQuestionsForStack(stack.id));
+                
+              // First look for exact match by ID
+              let actualQuestionId: string;
+              
+              if (typeof answer.questionId === 'object' && answer.questionId) {
+                const questionObj = answer.questionId as QuestionObject;
+                actualQuestionId = questionObj._id;
+              } else {
+                actualQuestionId = answer.questionId as string;
+              }
+              
+              const exactMatchQuestion = allQuestions.find(q => q.id === actualQuestionId);
+              
+              if (exactMatchQuestion) {
+                console.log(`Found exact match question: ${exactMatchQuestion.id} (${exactMatchQuestion.text.substring(0, 30)}...)`);
+                return {
+                  question: exactMatchQuestion,
+                  answer
+                };
+              }
+              
+              // If no exact match, create a placeholder question
+              const placeholderQuestion: Question = {
+                id: typeof answer.questionId === 'string' ? answer.questionId : 'unknown',
+                text: 'Unknown Question',
+                stackId: foundInterview.stackId,
+                difficulty: 'medium'
+              };
+              
+              console.log(`Created placeholder question: ${placeholderQuestion.id}`);
+              
+              return {
+                question: placeholderQuestion,
+                answer
+              };
+            });
+          }
+        }
+        
+        console.log(`Final QA map has ${qaMap.length} items`);
+        setQuestionsWithAnswers(qaMap);
+      }
+      
+      setLoading(false);
+    } catch (error) {
+      console.error('Error fetching interview data:', error);
+      setError('Failed to load interview data');
+      setLoading(false);
+    }
+  }, [reportId, interviews, getQuestionsForStack, availableTechStacks, refreshQuestions, refreshInterview]);
+
+  useEffect(() => {
+    fetchInterviewData();
+  }, [fetchInterviewData]);
+
+  // Function to fetch audio URL directly from the database
+  const fetchAnswerAudio = async (answerId: string) => {
+    try {
+      toast.info("Fetching audio data directly...");
+      
+      const token = localStorage.getItem('token');
+      const response = await fetch(
+        `${import.meta.env.VITE_API_URL || 'http://localhost:5000/api/v1'}/answers/${answerId}`, 
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          }
+        }
+      );
+      
+      if (!response.ok) {
+        console.error("Error fetching answer:", response.status);
+        toast.error("Failed to fetch audio URL");
+        return;
+      }
+      
+      const data = await response.json();
+      console.log("DIRECT DB ANSWER FOR AUDIO:", data);
+      
+      if (!data.success || !data.data) {
+        toast.error("Invalid answer data format");
+        return;
+      }
+      
+      const apiAnswer = data.data;
+      
+      if (!apiAnswer.audioUrl) {
+        toast.error("No audio URL found in database record");
+        return;
+      }
+      
+      // Force update the audio URL from the raw database record
+      setQuestionsWithAnswers(prev => 
+        prev.map(qa => 
+          qa.answer?.id === answerId 
+            ? { 
+                ...qa, 
+                answer: { 
+                  ...qa.answer, 
+                  audioUrl: apiAnswer.audioUrl
+                } 
+              } 
+            : qa
+        )
+      );
+      
+      toast.success("Audio URL updated from database");
+    } catch (error) {
+      console.error("Error fetching audio URL:", error);
+      toast.error("Failed to fetch audio data");
+    }
+  };
+
+  // Function to handle audio error
+  const handleAudioError = (answerId: string) => {
+    console.error(`Audio error for answer ${answerId}`);
+    toast.error("Failed to load audio file");
+  };
+
+  // Function to handle transcript reload
+  const handleTranscriptReload = async (answerId: string) => {
+    try {
+      toast.info("Attempting to reload transcript...");
+      
+      const token = localStorage.getItem('token');
+      const response = await fetch(
+        `${import.meta.env.VITE_API_URL || 'http://localhost:5000/api/v1'}/answers/${answerId}`, 
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          }
+        }
+      );
+      
+      if (!response.ok) {
+        console.error("Error fetching answer:", response.status);
+        toast.error("Failed to fetch transcript");
+        return;
+      }
+      
+      const data = await response.json();
+      console.log("DIRECT DB ANSWER FOR TRANSCRIPT:", data);
+      
+      if (!data.success || !data.data) {
+        toast.error("Invalid answer data format");
+        return;
+      }
+      
+      const apiAnswer = data.data;
+      
+      if (!apiAnswer.transcript) {
+        toast.error("No transcript found in database record");
+        return;
+      }
+      
+      // Force update the transcript from the raw database record
+      setQuestionsWithAnswers(prev => 
+        prev.map(qa => 
+          qa.answer?.id === answerId 
+            ? { 
+                ...qa, 
+                answer: { 
+                  ...qa.answer, 
+                  transcript: apiAnswer.transcript
+                } 
+              } 
+            : qa
+        )
+      );
+      
+      toast.success("Transcript updated from database");
+    } catch (error) {
+      console.error("Error fetching transcript:", error);
+      toast.error("Failed to fetch transcript data");
+    }
+  };
+
+  // Function to handle manual transcript entry
+  const handleManualTranscript = async (answerId: string, audioUrl?: string) => {
+    try {
+      toast.info("Attempting to manually transcribe audio...");
+      
+      // First make sure we have the audio URL
+      if (!audioUrl) {
+        toast.error("No audio available to transcribe");
+        return;
+      }
+      
+      // Get the audio file
+      const fullAudioUrl = getFullAudioUrl(audioUrl);
+      if (!fullAudioUrl) {
+        toast.error("Could not construct audio URL");
+        return;
+      }
+      
+      const audioResponse = await fetch(fullAudioUrl);
+      if (!audioResponse.ok) {
+        toast.error("Failed to fetch audio file");
+        return;
+      }
+      
+      // Convert to blob
+      const audioBlob = await audioResponse.blob();
+      
+      // Manually create a transcript
+      const manualTranscript = "[Manually transcribed] This is a placeholder transcript. The actual audio content couldn't be automatically transcribed.";
+      
+      // Find the answer in the current state
+      const currentAnswer = questionsWithAnswers.find(qa => qa.answer?.id === answerId)?.answer;
+      if (!currentAnswer) {
+        toast.error("Answer not found in current state");
+        return;
+      }
+      
+      // Create an updated answer with the manual transcript
+      const updatedAnswer: Answer = {
+        ...currentAnswer,
+        transcript: manualTranscript
+      };
+      
+      // Update the answer in the database
+      await answerAPI.update(answerId, { 
+        score: currentAnswer.score,
+        feedback: currentAnswer.feedback,
+        transcript: manualTranscript
+      });
+      
+      // Update local state
+      setQuestionsWithAnswers(prev => {
+        return prev.map(qa => {
+          if (qa.answer && qa.answer.id === answerId) {
+            return {
+              ...qa,
+              answer: updatedAnswer
+            };
+          }
+          return qa;
+        });
+      });
+      
+      toast.success("Manual transcript added!");
+    } catch (error) {
+      console.error("Transcription error:", error);
+      toast.error("Error during transcription");
+    }
+  };
+
+  return (
+    <Layout>
+      <div className="container mx-auto py-6">
+        <div className="flex items-center mb-6">
+          <Button 
+            variant="ghost" 
+            className="mr-2"
+            onClick={handleBack}
+          >
+            <ChevronLeft className="mr-1" size={16} />
+            Back to Dashboard
+          </Button>
+          <h1 className="text-2xl font-bold">Interview Report</h1>
+        </div>
+        
+        {loading ? (
+          <div className="text-center py-10">
+            <p>Loading interview data...</p>
+          </div>
+        ) : error ? (
+          <div className="text-center py-10 text-red-500">
+            <p>{error}</p>
+          </div>
+        ) : interview ? (
+          <>
+            <Card className="mb-6">
+              <CardHeader>
+                <CardTitle>Interview Summary</CardTitle>
+                <CardDescription>
+                  Overview of the interview performance
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                  <div className="flex items-center">
+                    <Calendar className="mr-2 text-gray-500" size={20} />
+                    <div>
+                      <p className="text-sm text-gray-500">Date</p>
+                      <p className="font-medium">{interview.scheduledDate}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center">
+                    <Clock className="mr-2 text-gray-500" size={20} />
+                    <div>
+                      <p className="text-sm text-gray-500">Duration</p>
+                      <p className="font-medium">{interview.duration} minutes</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center">
+                    <User className="mr-2 text-gray-500" size={20} />
+                    <div>
+                      <p className="text-sm text-gray-500">Status</p>
+                      <p className="font-medium capitalize">{interview.status}</p>
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div>
+                    <h3 className="text-lg font-medium mb-3">Overall Score</h3>
+                    <div className="bg-gray-100 p-4 rounded-lg flex items-center justify-center">
+                      <div className="text-center">
+                        <div className="text-5xl font-bold mb-2">
+                          {averageScore !== null ? averageScore : 'N/A'}
+                          {averageScore !== null && <span className="text-lg">/10</span>}
+                        </div>
+                        <p className="text-sm text-gray-500">Average score across all questions</p>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div>
+                    <h3 className="text-lg font-medium mb-3">Criteria Breakdown</h3>
+                    <div className="bg-gray-100 p-4 rounded-lg" style={{ height: '200px' }}>
+                      {criteriaAverages && criteriaAverages.length > 0 ? (
+                        <RadarChartDisplay data={criteriaAverages} />
+                      ) : (
+                        <div className="h-full flex items-center justify-center text-gray-500">
+                          <p>No criteria data available</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+            
+            <h2 className="text-xl font-bold mb-4">Questions & Answers</h2>
+            
+            {questionsWithAnswers.length > 0 ? (
+              questionsWithAnswers.map((qa, index) => (
+                <Card key={qa.question.id} className="mb-4">
+                  <CardHeader>
+                    <CardTitle className="text-lg">
+                      Question {index + 1}: {qa.question.text}
+                    </CardTitle>
+                    <CardDescription>
+                      Difficulty: <span className="capitalize">{qa.question.difficulty || 'medium'}</span>
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    {qa.answer ? (
+                      <div className="space-y-4">
+                        <div>
+                          <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+                            <Info size={16} className="mr-1" /> Score
+                          </h4>
+                          <div className="flex items-center">
+                            <div className="text-3xl font-bold mr-2">
+                              {qa.answer.score !== undefined ? qa.answer.score : 'N/A'}
+                              {qa.answer.score !== undefined && <span className="text-lg">/10</span>}
+                            </div>
+                            {qa.answer.score !== undefined && (
+                              <div className={`ml-2 px-2 py-1 rounded text-xs ${
+                                qa.answer.score >= 7 ? 'bg-green-100 text-green-800' : 
+                                qa.answer.score >= 5 ? 'bg-yellow-100 text-yellow-800' : 
+                                'bg-red-100 text-red-800'
+                              }`}>
+                                {qa.answer.score >= 7 ? 'Good' : qa.answer.score >= 5 ? 'Average' : 'Needs Improvement'}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        
+                        <div>
+                          <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+                            <Info size={16} className="mr-1" /> Audio Response
+                          </h4>
+                          <AudioPlayer 
+                            audioUrl={qa.answer.audioUrl ? getFullAudioUrl(qa.answer.audioUrl) : undefined}
+                            onError={() => handleAudioError(qa.answer?.id || '')}
+                            onReload={() => qa.answer?.id && fetchAnswerAudio(qa.answer.id)}
+                          />
+                        </div>
+                        
+                        <div>
+                          <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+                            <Info size={16} className="mr-1" /> Transcript
+                          </h4>
+                          <TranscriptViewer 
+                            transcript={qa.answer.transcript}
+                            onReload={() => qa.answer?.id && handleTranscriptReload(qa.answer.id)}
+                            onManualTranscript={() => qa.answer?.id && handleManualTranscript(qa.answer.id, qa.answer.audioUrl)}
+                          />
+                        </div>
+                        
+                        {qa.answer.feedback && (
+                          <div>
+                            <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+                              <Info size={16} className="mr-1" /> AI Feedback
+                            </h4>
+                            <div className="p-4 bg-blue-50 rounded-lg text-sm whitespace-pre-line">
+                              {qa.answer.feedback}
+                            </div>
+                          </div>
+                        )}
+                        
+                        {qa.answer.criteria && (
+                          <div>
+                            <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+                              <Info size={16} className="mr-1" /> Criteria Breakdown
+                            </h4>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                              {qa.answer.criteria && Object.entries(qa.answer.criteria).map(([key, value]) => {
+                                // Skip if value is not a number
+                                if (typeof value !== 'number') return null;
+                                
+                                return (
+                                  <div key={key} className="p-3 bg-gray-50 rounded-lg">
+                                    <div className="text-xs text-gray-500 mb-1">
+                                      {key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase())}
+                                    </div>
+                                    <div className="text-lg font-medium">{value} <span className="text-xs">/ 10</span></div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-center py-6 text-gray-500">
+                        <p>No answer provided for this question</p>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              ))
+            ) : (
+              <div className="text-center py-6 text-gray-500">
+                <p>No questions found for this interview</p>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="text-center py-10 text-gray-500">
+            <p>No interview data found</p>
+          </div>
+        )}
+      </div>
+    </Layout>
+  );
+};
+
+export default InterviewReport;
